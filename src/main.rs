@@ -1,6 +1,6 @@
 #[macro_use] extern crate prettytable;
 
-use std::{path::Path, vec};
+use std::{fs::OpenOptions, path::Path, vec};
 use std::path::PathBuf;
 use std::io::{self, Read, stdin, BufReader};
 use std::io::prelude::*;
@@ -10,18 +10,22 @@ use types::*;
 use wgman_core::types;
 use structopt::StructOpt;
 use prettytable::{Table};
-use reqwest::{StatusCode, header::AUTHORIZATION};
+use reqwest::{Response, StatusCode, header::AUTHORIZATION};
 use futures::executor::block_on;
 use ipnetwork::IpNetwork;
-use serde::{Deserialize};
+use serde::{Deserialize, de::DeserializeOwned};
+
+macro_rules! printdbg {
+    ($dbg_enabled:expr, $fmt:expr) => { if $dbg_enabled { (println!($fmt)); } };
+    ($dbg_enabled:expr, $fmt:expr, $($arg:tt)*) => { if $dbg_enabled { (println!($fmt, $($arg)*)); } };
+}
 
 #[derive(Debug, StructOpt, Clone)]
 #[structopt(name = "wgmancli", about = "Wgman cli StructOpt.")]
 struct Opt {
-    /// Activate debug mode
-    // short and long flags (-d, --debug) will be deduced from the field's name
+    /// Activate verbose mode
     #[structopt(short, long)]
-    debug: bool,
+    verbose: bool,
     
     // Use `env` to enable specifying the option with an environment
     // variable. Command line arguments take precedence over env.
@@ -52,7 +56,7 @@ struct Opt {
     /// Resource to interact with: (all, interface, peers, endpoints, admin)/(pw)
     /// eg: interface, interface/pw, admin/pw
     #[structopt(short = "r", long = "resource", default_value = "interface")]
-    resource: PathBuf,
+    resource: String,
 
     /// Action to apply to resource: (list, push, pull, remove)
     #[structopt(short = "a", long = "action", default_value = "list")]
@@ -77,15 +81,13 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("getting opt");
-
     run(Opt::from_args()).unwrap();
 
     Ok(())
 }
 
 fn run(opt: Opt) -> io::Result<()> {
-    println!("running cmd");
+    printdbg!(opt.verbose.clone(), "running cmd");
     let mut reader: Option<Box<dyn Read>> = match (&opt.input_json, &opt.input) {
         (false, _) => None,
         (true, None) => Some(Box::new(stdin())),
@@ -93,278 +95,140 @@ fn run(opt: Opt) -> io::Result<()> {
     };
     let Opt { api_url, resource, action, .. } = &opt.clone();
     let client = reqwest::Client::new();
-    let resource = resource.to_str().unwrap();
-    println!("getting auth");
+    printdbg!(opt.verbose.clone(), "getting auth");
     let auth_type = match &opt.admin_auth {
         true => "aauth",
         false => "iauth"
     };
     let auth = get_auth_header(&opt);
-    match (resource, action.as_str()) {
-        ("conf", "list") => {
-            let url = format!("http://{}/{}/{}/list", api_url, auth_type, resource);
+    match (resource.as_str(), action.as_str()) {
+        ("confs", "get") => {
+            let url = format!("http://{}/{}/interfaces/{}/configs", api_url, auth_type, &opt.interface.clone().unwrap());
 
-            let resp = match block_on(client
+            let config = handle_json_response(opt.clone(), block_on(client
             .get(url.as_str())
             .header(AUTHORIZATION, &auth)
-            .send()) {
-                Ok(response) => response,
-                Err(error) => {
-                    println!("Error getting interface list:\n {}", error);
-                    std::process::exit(1);
-                }
-            };
+            .send()));
             
-            let interfaces = block_on(resp.json::<Vec<types::ApiInterface>>()).unwrap();
-
-            // in_out(&mut reader, &mut writer, &opt, ).unwrap();
-            let url = format!("http://{}/{}/{}/list/{}", api_url, auth_type, resource, &opt.interface.clone().unwrap());
-
-            let resp = block_on(client
-            .get(url.as_str())
-            .header(AUTHORIZATION, &auth)
-            .send())
-            .unwrap();
-
-            let peer = block_on(resp.json::<Vec<types::ApiPeerRelation>>()).unwrap();
-            
-            let url = format!("http://{}/{}/{}/list/{}", api_url, auth_type, resource, &opt.interface.clone().unwrap());
-
-            let resp = block_on(client
-            .get(url.as_str())
-            .header(AUTHORIZATION, &auth)
-            .send())
-            .unwrap();
-
-            let endpoint = block_on(resp.json::<Vec<types::ApiPeerRelation>>()).unwrap();
-
-            render_interfaces(interfaces);
-            render_peer_relations(endpoint);
-            render_peer_relations(peer);
+            interface_config_table(config).printstd();
         },
-        ("conf", "push") => {
+        ("confs", "list") => {
+            let url = format!("http://{}/{}/configs", api_url, auth_type);
+
+            let configs: Vec<ApiConfig> = handle_json_response(opt.clone(), block_on(client
+            .get(url.as_str())
+            .header(AUTHORIZATION, &auth)
+            .send()));
+            
+            for config in configs {
+                interface_config_table(config).printstd();
+            }
+        },
+        ("confs", "push") => {
             let conf = ApiConfig::from(load_interface_cfg(&opt));
-            let interface = conf.interface;
-            
-            let url = format!("http://{}/{}/interface/set", api_url, auth_type);
-            println!("interface push");
-            let resp = block_on(client
+            let url = format!("http://{}/{}/configs", api_url, auth_type);
+
+            printdbg!(opt.verbose.clone(), "interface config push");
+            interface_config_table(conf.clone());
+
+            handle_response(opt.clone(), block_on(client
             .post(url.as_str())
-            .json(&interface)
+            .json(&conf)
             .header(AUTHORIZATION, auth.clone())
-            .send())
-            .unwrap();
-            println!("Sent:");
-
-            match resp.status() {
-                StatusCode::OK => println!("Success!"),
-                _ => println!("Oops! {}", block_on(resp.text()).unwrap())
-            }
-
-            let interface_name = &opt.interface.unwrap();
-            let peer_url = format!("http://{}/{}/peer/set/{}", api_url, auth_type, interface_name);
-            let endpoint_url = format!("http://{}/{}/endpoint/set/{}", api_url, auth_type, interface_name);
-
-            match interface.public_key.clone() {
-                Some(ipk) => {
-                    for pr in conf.peers {
-                        if ipk == pr.peer_public_key.clone() {
-                            println!("peer push");
-                            let resp = block_on(client
-                            .post(peer_url.as_str())
-                            .json(&interface)
-                            .header(AUTHORIZATION, auth.clone())
-                            .send())
-                            .unwrap();
-                            println!("Sent:");
-                            match resp.status() {
-                                StatusCode::OK => println!("Success!"),
-                                _ => println!("Oops! {}", block_on(resp.text()).unwrap())
-                            }
-                        }
-                        if ipk == pr.endpoint_public_key.clone() {
-                            println!("endpoint push");
-                            let resp = block_on(client
-                            .post(endpoint_url.as_str())
-                            .json(&interface)
-                            .header(AUTHORIZATION, auth.clone())
-                            .send())
-                            .unwrap();
-                            println!("Sent:");
-                            match resp.status() {
-                                StatusCode::OK => println!("Success!"),
-                                _ => println!("Oops! {}", block_on(resp.text()).unwrap())
-                            }
-                        }
-                    }
-                }
-                _ => println!("selected interface is missing a public key, can't push any peer relations.")
-            }
-            
-
-            render_interfaces(vec![interface.clone()]);
-
+            .send()));
+            interface_config_table(conf);
         },
-        ("conf", "pull") => {
+        ("confs", "pull") => {
+            let url = format!("http://{}/{}/interfaces/{}/configs", api_url, auth_type, &opt.interface.clone().unwrap());
+
+            let config = handle_json_response(opt.clone(), block_on(client
+            .get(url.as_str())
+            .header(AUTHORIZATION, &auth)
+            .send()));
+
+            write_config(config, opt);
+        },
+        ("interfaces", "list") => {
+            // in_out(&mut reader, &mut writer, &opt, ).unwrap();
+            let url = format!("http://{}/{}/{}", api_url, auth_type, resource);
+            printdbg!(opt.verbose.clone(), "{}", url.as_str());
+            let interfaces = handle_json_response(opt.clone(), block_on(client
+            .get(url.as_str())
+            .header(AUTHORIZATION, auth)
+            .send()));
+            interfaces_table(interfaces).printstd();
+        },
+        ("interfaces", "get") => {
+            // in_out(&mut reader, &mut writer, &opt, ).unwrap();
             let interface_name = &opt.interface.clone().unwrap();
             let url = format!("http://{}/{}/{}/{}", api_url, auth_type, resource, interface_name);
-            let mut local_interface = get_interface(&opt, reader.as_mut());
+            printdbg!(opt.verbose.clone(), "interfaces get {}", url.as_str());
 
-            let resp = match block_on(client
-            .get(url.as_str())
-            .header(AUTHORIZATION, &auth)
-            .send()) {
-                Ok(response) => response,
-                Err(error) => {
-                    println!("Error getting interface:\n {}", error);
-                    std::process::exit(1);
-                }
-            };
-            
-            let api_interface = block_on(resp.json::<ApiInterface>()).unwrap();
-            local_interface.coallesce(api_interface);
-            // in_out(&mut reader, &mut writer, &opt, ).unwrap();
-            let url = format!("http://{}/{}/{}/list/{}", api_url, auth_type, resource, interface_name);
-
-            let resp = block_on(client
-            .get(url.as_str())
-            .header(AUTHORIZATION, &auth)
-            .send())
-            .unwrap();
-
-            let peer = block_on(resp.json::<Vec<ApiPeerRelation>>()).unwrap();
-            
-            let url = format!("http://{}/{}/{}/list/{}", api_url, auth_type, resource, interface_name);
-
-            let resp = block_on(client
-            .get(url.as_str())
-            .header(AUTHORIZATION, &auth)
-            .send())
-            .unwrap();
-
-            let endpoint = block_on(resp.json::<Vec<ApiPeerRelation>>()).unwrap();
-
-            // coallesce
-
-            render_interfaces(vec![local_interface.clone()]);
-            render_peer_relations(endpoint.clone());
-            render_peer_relations(peer.clone());
-
-            write_config(local_interface, peer, endpoint);
-        },
-        ("interface", "list") => {
-            // in_out(&mut reader, &mut writer, &opt, ).unwrap();
-            let url = format!("http://{}/{}/{}/list", api_url, auth_type, resource);
-
-            match block_on(client
+            let interface: ApiInterface = handle_json_response(opt.clone(), block_on(client
             .get(url.as_str())
             .header(AUTHORIZATION, auth)
-            .send()) {
-                Ok(response) => match response.status() {
-                    StatusCode::OK => {
-                        match block_on(response.json::<Vec<ApiInterface>>()) {
-                            Ok(interfaces) => {
-                                render_interfaces(interfaces);
-                                println!("Success!")
-                            },
-                            _ => println!("Couldn't deserialize response.")
-                        }
-                        
-                    },
-                    r => println!("Oops! {} {}", r, block_on(response.text()).unwrap())
-                },
-                Err(error) => {
-                    println!("Error getting interface list:\n {}", error);
-                    std::process::exit(1);
-                }
-            };
-            
-            
-
+            .send()));
+            interfaces_table(vec![interface]).printstd();
 
         },
-        ("interface", "push") => {
+        ("interfaces", "push") => {
             let url = format!("http://{}/{}/{}", api_url, auth_type, resource);
-            println!("interface push");
+            printdbg!(opt.verbose.clone(), "interfaces push");
             let interface = get_interface(&opt, reader.as_mut());
-            let resp = block_on(client
+            handle_response(opt.clone(), block_on(client
             .post(url.as_str())
             .json(&interface)
             .header(AUTHORIZATION, auth)
-            .send())
-            .unwrap();
-            println!("Sent:");
-            render_interfaces(vec![interface.clone()]);
-
-            match resp.status() {
-                StatusCode::OK => println!("Success!"),
-                _ => println!("Oops! {}", block_on(resp.text()).unwrap())
-            }
+            .send()));
+            dbg!(interface.clone().public_key.unwrap().len());
+            // render_interfaces(vec![interface.clone()]);
         },
-        ("interface", "remove") => {
-            println!("interface remove");
+        ("interfaces", "remove") => {
+            printdbg!(opt.verbose.clone(), "interface remove");
             let interface = get_interface(&opt, reader.as_mut());
-            let url = format!("http://{}/{}/interface/remove/{}", api_url, auth_type, interface.u_name);
+            let url = format!("http://{}/{}/{}/{}", api_url, auth_type, resource, interface.u_name);
+            printdbg!(opt.verbose.clone(), "interfaces remove {}", url.as_str());
 
-            let resp = block_on(client
+            handle_response(opt.clone(), block_on(client
             .delete(url.as_str())
             .header(AUTHORIZATION, auth)
-            .send())
-            .unwrap();
-            println!("Sent:");
-            render_interfaces(vec![interface.clone()]);
-
-            match resp.status() {
-                StatusCode::OK => println!("Success!"),
-                _ => println!("Oops! {}", block_on(resp.text()).unwrap())
-            }
+            .send()));
         },
         ("peer", "list") => {
             // in_out(&mut reader, &mut writer, &opt, ).unwrap();
-            let url = format!("http://{}/{}/{}/list/{}", api_url, auth_type, resource, &opt.interface.unwrap());
+            let url = format!("http://{}/{}/interfaces/{}/peers", api_url, auth_type,opt.interface.as_ref().unwrap());
 
-            let resp = block_on(client
+            let peers: Vec<ApiPeerRelation> = handle_json_response(opt.clone(), block_on(client
             .get(url.as_str())
             .header(AUTHORIZATION, auth)
-            .send())
-            .unwrap();
+            .send()));
 
-            let peer = block_on(resp.json::<Vec<ApiPeerRelation>>()).unwrap();
-            render_peer_relations(peer);
+            peer_relation_table(peers).printstd();
         },
         ("endpoint", "list") => {
             // in_out(&mut reader, &mut writer, &opt, ).unwrap();
-            let url = format!("http://{}/{}/{}/list/{}", api_url, auth_type, resource, &opt.interface.unwrap());
+            let url = format!("http://{}/{}/interfaces/{}/endpoints", api_url, auth_type, opt.interface.as_ref().unwrap());
 
-            let resp = block_on(client
+            let endpoints: Vec<ApiPeerRelation> = handle_json_response(opt.clone(), block_on(client
             .get(url.as_str())
             .header(AUTHORIZATION, auth)
-            .send())
-            .unwrap();
+            .send()));
 
-            let endpoint = block_on(resp.json::<Vec<ApiPeerRelation>>()).unwrap();
-            render_peer_relations(endpoint);
+            peer_relation_table(endpoints).printstd();
         },
         ("peer-relation", "push") => {
             match &opt.admin_auth {
                 false => println!("pushing peer-relations is only available with admin authentication."),
                 true => {
                     let url = format!("http://{}/{}/{}", api_url, auth_type, resource);
-                    println!("peer_relation push");
+                    printdbg!(opt.verbose.clone(), "peer_relation push");
                     let peer_relation: ApiPeerRelation = get_json_input(&opt, reader.as_mut().unwrap(), &mut String::new());
-                    let resp = block_on(client
+                    handle_response(opt.clone(), block_on(client
                     .post(url.as_str())
                     .json(&peer_relation)
                     .header(AUTHORIZATION, auth)
-                    .send())
-                    .unwrap();
-                    println!("Sent:");
-                    render_peer_relations(vec![peer_relation.clone()]);
-        
-                    match resp.status() {
-                        StatusCode::OK => println!("Success!"),
-                        _ => println!("Oops! {}", block_on(resp.text()).unwrap())
-                    }
+                    .send()));
+                    peer_relation_table(vec![peer_relation.clone()]).printstd();
                 }
             }
            
@@ -373,28 +237,21 @@ fn run(opt: Opt) -> io::Result<()> {
             match &opt.admin_auth {
                 false => println!("removing peer-relations is only available with admin authentication."),
                 true => {
-                    println!("peer_relation remove");
+                    printdbg!(opt.verbose.clone(), "peer_relation remove");
                     let peer_relation: ApiPeerRelation = get_json_input(&opt, reader.as_mut().unwrap(), &mut String::new());
-                    let url = format!("http://{}/{}/pr/remove/{}/{}", api_url, auth_type, peer_relation.endpoint_public_key, peer_relation.peer_public_key);
+                    let url = format!("http://{}/{}/pr/remove/{}/{}", api_url, auth_type, peer_relation.endpoint_name.as_ref().unwrap(), peer_relation.peer_name.as_ref().unwrap());
         
-                    let resp = block_on(client
+                    handle_response(opt.clone(), block_on(client
                     .delete(url.as_str())
                     .header(AUTHORIZATION, auth)
-                    .send())
-                    .unwrap();
-                    println!("Sent:");
-                    render_peer_relations(vec![peer_relation.clone()]);
-        
-                    match resp.status() {
-                        StatusCode::OK => println!("Success!"),
-                        _ => println!("Oops! {}", block_on(resp.text()).unwrap())
-                    }
+                    .send()));
+                    peer_relation_table(vec![peer_relation.clone()]).printstd();
                 }
             }
         }, 
         ("admin", "remove") => {
             match &opt.admin_auth {
-                false => println!("removing admin users is only available with admin authentication."),
+                false => printdbg!(opt.verbose.clone(), "removing admin users is only available with admin authentication."),
                 true => {
                     match reader {
                         Some(mut reader) => {
@@ -404,57 +261,40 @@ fn run(opt: Opt) -> io::Result<()> {
                         }
                         None => println!("removing admin users is only available with input."),
                     }
-
                 }
             }
         },
-        ("pw/admin", "push") => {
+        ("admin/pw", "push") => {
             match &opt.admin_auth {
-                false => println!("pushing admin user pw is only available with admin authentication."),
+                false => printdbg!(opt.verbose.clone(), "pushing admin user pw is only available with admin authentication."),
                 true => {
                     match reader {
                         Some(mut reader) => {
                             let admin_pw: ApiAdminPassword = get_json_input(&opt, &mut reader, &mut String::new());
-                            let url = format!("http://{}/{}/pw/admin/", api_url, auth_type);
+                            let url = format!("http://{}/{}/admins/passwords/", api_url, auth_type);
 
-                            let resp = block_on(client
+                            handle_response(opt.clone(), block_on(client
                                 .post(url.as_str())
                                 .json(&admin_pw)
                                 .header(AUTHORIZATION, auth)
-                                .send());
-                                
-                                println!("Sent:");
-                    
-                                match resp {
-                                    Ok(resp) if resp.status() == StatusCode::OK => println!("Success!"),
-                                    Ok(resp) => println!("Oops! {} {}", resp.status(), block_on(resp.text()).unwrap()),
-                                    Err(err) => println!("Oops! {}", err)
-                                }
+                                .send()));
                         }
                         None => println!("pushing admin user pw is only available with input."),
                     }
                 }
             }
         },
-        ("pw/interface", "push") => {
+        ("interface/pw", "push") => {
             match reader {
                 Some(mut reader) => {
                     let interface_pw: ApiInterfacePassword = get_json_input(&opt, &mut reader, &mut String::new());
-                    let url = format!("http://{}/{}/pw/interface/", api_url, auth_type);
+                    let url = format!("http://{}/{}/interfaces/passwords/", api_url, auth_type);
                     dbg!(url.clone());
-                    let resp = block_on(client
+                    handle_response(opt.clone(), block_on(client
                         .post(url.as_str())
                         .json(&interface_pw)
                         .header(AUTHORIZATION, auth)
-                        .send());
-                        
-                        println!("Sent:");
-            
-                        match resp {
-                            Ok(resp) if resp.status() == StatusCode::OK => println!("Success!"),
-                            Ok(resp) => println!("Oops! {} {}", resp.status(), block_on(resp.text()).unwrap()),
-                            Err(err) => println!("Oops! {}", err)
-                        }
+                        .send()));
                 }
                 None => println!("pushing interface user pw is only available with input."),
             }
@@ -465,7 +305,6 @@ fn run(opt: Opt) -> io::Result<()> {
         }
     };
     Ok(())
-    // cat(reader, writer)
 }
 
 fn get_auth_header(opt: &Opt) -> String {
@@ -475,32 +314,16 @@ fn get_auth_header(opt: &Opt) -> String {
     let mut auth = opt.wgman_dir.clone();
     auth.push(opt.interface.as_ref().unwrap().to_string());
     auth.push(Path::new("auth"));
-    let file = fs::File::open(auth).expect("Something went wrong reading the password file");
+    let mut file = fs::File::open(auth).expect("Something went wrong reading the password file");
+    
+    let mut password = String::new();
+    file.read_to_string(&mut password).expect("could not read from input");
 
-    let mut name = None;
-    let mut password = None;
-    for line in BufReader::new(file).lines() {
-        let l = line.expect("Something went wrong reading the password file");
-        let l = l.trim();
-        // ignore empty or commented lines
-        if l.len() == 0 || l.chars().next().unwrap() == '#' {
-            continue;
-        }
-        let mut kv= l.splitn(2, "=");
-        let k = kv.next().expect("Failed to parse password file.").trim();
-        let v = kv.next().expect("Failed to parse password file.").trim().to_string();
-        match k {
-            "NAME" => name = Some(v),
-            "PASSWORD" => password = Some(v),
-            _ => {}
-        };
-    }
-    // println!("{}:{}", name.as_ref().unwrap(), password.as_ref().unwrap());
-    BasicAuth{ name: name.expect("Interface password file missing NAME key"), password: password.expect("Interface password file missing PASSWORD key") }.to_string()
+    BasicAuth { name: opt.interface.clone().unwrap(), password: password.trim().to_string() }.to_string()
 }
 
 fn load_interface_cfg(opt: &Opt) -> InterfaceConfig {
-    println!("loading interface conf");
+    printdbg!(opt.verbose.clone(), "loading interface conf");
     let mut conf_path = opt.wgman_dir.clone();
     let interface_name = opt.interface.as_ref().unwrap().to_string();
     conf_path.push(&interface_name);
@@ -541,7 +364,7 @@ fn load_interface_cfg(opt: &Opt) -> InterfaceConfig {
                     "ListenPort" => conf.interface.port = Some(v.parse::<i32>().unwrap()),
                     "Address" => conf.interface.ip = Some(v.parse::<IpNetwork>().unwrap()),
                     _ => {
-                        println!("Warning: '{}' not recognized as key in [Interface]", k);
+                        printdbg!(opt.verbose.clone(), "Warning: '{}' not recognized as key in [Interface]", k);
                     }
                 };
             },
@@ -564,12 +387,12 @@ fn load_interface_cfg(opt: &Opt) -> InterfaceConfig {
                         cur_peer.endpoint = Some(v);
                     },
                     _ => {
-                        println!("Warning: '{}' not recognized as key in [Peer]", k);
+                        printdbg!(opt.verbose.clone(), "Warning: '{}' not recognized as key in [Peer]", k);
                     }                
                 };
             },
             None => {
-                println!("Warning: '{}' not a valid config block, or not associated with a valid config block", k);
+                printdbg!(opt.verbose.clone(), "Warning: '{}' not a valid config block, or not associated with a valid config block", k);
             }
         };
         
@@ -585,7 +408,7 @@ fn load_interface_cfg(opt: &Opt) -> InterfaceConfig {
     file.read_to_string(&mut pubkey).expect("failed to read the public key file");
     conf.interface.public_key = Some(pubkey.trim().to_string());
 
-    // fqdn to be loaded from file as well?
+    // fqdn to be loaded from file somewhere as well?
 
     conf
 }
@@ -605,10 +428,68 @@ fn get_json_input<'a, T: Deserialize<'a>>(_opt: &Opt, reader: &mut Box<dyn Read>
     serde_json::from_str(input).expect("failed to parse json input")
 }
 
-fn render_interfaces(interfaces: Vec<ApiInterface>) {
+fn handle_json_response<T: DeserializeOwned>(_opt: Opt, resp: Result<Response, reqwest::Error>) -> T {
+    match resp {
+        Ok(resp) => match resp.status() {
+            StatusCode::OK => match block_on(resp.json::<T>()) {
+                Ok(parsed_t) => parsed_t,
+                Err(_) => {
+                    println!("Status code OK, but failed to parse response, exiting.");
+                    std::process::exit(1);
+                }
+            },
+            code => {
+                match block_on(resp.json::<ErrorMessage>()) {
+                    Ok(parsed_err) => render_api_error_message(parsed_err),
+                    Err(_) => {
+                        println!("Status code {}, and failed to parse response, exiting.", code);
+                    }
+                }
+                std::process::exit(1);
+            }
+        },
+        Err(error) => {
+            println!("Error getting response:\n {}", error);
+            std::process::exit(1);
+        }
+    }
+    
+}
+
+fn handle_response(_opt: Opt, resp: Result<Response, reqwest::Error>) {
+    match resp {
+        Ok(resp) => match resp.status() {
+            StatusCode::OK => println!("Success!"),
+            StatusCode::CREATED => println!("Resource successfully created."),
+            code => {
+                match block_on(resp.json::<ErrorMessage>()) {
+                    Ok(parsed_err) => render_api_error_message(parsed_err),
+                    Err(_) => {
+                        println!("Status code {}, and failed to parse response, exiting.", code);
+                    }
+                }
+                std::process::exit(1);
+            }
+        },
+        Err(error) => {
+            println!("Error getting response:\n {}", error);
+            std::process::exit(1);
+        }
+    }
+    
+}
+
+fn render_api_error_message (err: ErrorMessage) {
+    let mut table = Table::new();
+    table.add_row(row!["CODE", "API ERROR MESSAGE"]);
+    table.add_row(row![err.code, err.message]);
+    table.printstd();
+}
+
+fn interfaces_table(interfaces: Vec<ApiInterface>) -> Table{
     // Create the table
     let mut table = Table::new();
-
+    table.add_row(row![cH5 => "INTERFACE"]);
     table.add_row(row!["NAME", "PUBLIC KEY", "PORT", "IP", "FQDN"]);
 
     for interface in interfaces {
@@ -620,19 +501,22 @@ fn render_interfaces(interfaces: Vec<ApiInterface>) {
             interface.fqdn.unwrap_or_default()
         ]);
     }
-    table.printstd();
+    table
 }
 
-fn render_peer_relations(peer_relations: Vec<ApiPeerRelation>) {
+fn peer_relation_table(peer_relations: Vec<ApiPeerRelation>) -> Table {
     // Create the table
     let mut table = Table::new();
-
-    table.add_row(row!["ENDPOINT PUBKEY", "PEER PUBKEY", "ENDPOINT ALLOWED IPs", "PEER ALLOWED IPs"]);
+    table.add_row(row![cH5 => "PEER"]);
+    table.add_row(row!["ENDPOINT", "ENDPOINT NAME", "PEER NAME", "ENDPOINT PUBKEY", "PEER PUBKEY", "ENDPOINT ALLOWED IPs", "PEER ALLOWED IPs"]);
 
     for pr in peer_relations {
         table.add_row(row![
-            pr.endpoint_public_key, 
-            pr.peer_public_key,
+            pr.endpoint.unwrap_or(String::new()),
+            pr.endpoint_name.unwrap_or(String::new()),
+            pr.peer_name.unwrap_or(String::new()),
+            pr.endpoint_public_key.unwrap_or(String::new()), 
+            pr.peer_public_key.unwrap_or(String::new()),
             match pr.endpoint_allowed_ip {
                 Some(allowed_ip) => allowed_ip
                                     .iter()
@@ -651,9 +535,92 @@ fn render_peer_relations(peer_relations: Vec<ApiPeerRelation>) {
             },
         ]);
     }
-    table.printstd();
+    table
 }
 
-fn write_config(interface: ApiInterface, peers: Vec<ApiPeerRelation>, endpoints: Vec<ApiPeerRelation>) {
-    
+fn interface_config_table(ApiConfig { interface, peers }: ApiConfig) -> Table {
+    // Create the table
+    let mut table = Table::new();
+    table.add_row(row![c => "INTERFACE CONFIG"]);
+    table.add_row(row![interfaces_table(vec![interface])]);
+    table.add_row(row![peer_relation_table(peers)]);
+    table
 }
+
+fn write_config(ApiConfig { interface, peers }: ApiConfig, Opt { interface: interface_name, wgman_dir, .. }: Opt) {
+    let mut interface_path = wgman_dir.clone();
+    let interface_name = interface_name.as_ref().unwrap().to_string();
+    interface_path.push(&interface_name);
+
+    let mut priv_path = interface_path.clone();
+    priv_path.push("private");
+    let mut priv_reader = fs::File::open(priv_path).expect("Could not open file containing private key.");
+    let mut priv_key = String::new();
+    priv_reader.read_to_string(&mut priv_key).expect("could not read from input");
+    let port = match interface.port {
+        Some(p) => p.to_string(),
+        None => String::new()
+    };
+
+    // verify configured public key is a match for private key, else throw error?
+
+    let mut interface_data = format!("[Interface]\n\
+                                              PrivateKey = {}\n\
+                                              ListenPort = {}\n\
+    ", priv_key.trim(), port);
+
+    match interface.ip {
+        Some(ip) => interface_data.push_str(&format!("IP = {}\n", ip.to_string())),
+        None => {}
+    }
+
+    let mut config_path = interface_path.clone();
+    config_path.push(&format!("{}.conf.test", &interface_name));
+
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(config_path.clone()).expect("could not open or create the interface config file");
+        
+    f.write_all(interface_data.as_bytes()).expect("Unable to write interface data");
+    
+    let mut f = OpenOptions::new()
+    .append(true)
+    .create(true)
+    .open(config_path.clone()).expect("could not open or create the interface config file");
+
+    if interface.public_key.as_ref().is_some() {
+        for peer in peers {
+            let (pk, allowed_ips) = match interface.clone() {
+                interface if peer.peer_public_key == interface.public_key =>
+                (
+                    peer.endpoint_public_key, 
+                    peer.endpoint_allowed_ip
+                    .unwrap_or(vec![])
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+                ),
+                interface if peer.endpoint_public_key == interface.public_key =>
+                (
+                    peer.peer_public_key,  
+                    peer.peer_allowed_ip
+                    .unwrap_or(vec![])
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+                ),
+                _ => (None, String::new())
+            };
+
+            let peer_data = format!("\n[Peer]\n\
+                                              PublicKey = {}\n\
+                                              AllowedIPs = {}\n\
+            ", pk.unwrap_or(String::new()), allowed_ips);
+            f.write_all(peer_data.as_bytes()).expect("Unable to write interface data");
+        }
+    }
+}
+
